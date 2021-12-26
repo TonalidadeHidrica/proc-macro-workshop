@@ -3,10 +3,11 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
 use syn::{
-    parse_macro_input, Data, DeriveInput, Fields, GenericArgument, Ident, PathArguments, Type,
+    parse_macro_input, parse_str, Data, DeriveInput, Field, Fields, GenericArgument, Ident, Lit,
+    Meta, NestedMeta, Path, PathArguments, Type,
 };
 
-#[proc_macro_derive(Builder)]
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
@@ -21,42 +22,71 @@ pub fn derive(input: TokenStream) -> TokenStream {
         Fields::Named(f) => f,
         Fields::Unnamed(_) | Fields::Unit => panic!("Tuple structs and units are not supported"),
     };
-    let option_types = fields.named.iter().map(|x| as_option(&x.ty)).collect_vec();
-    let constructor = fields.named.iter().zip(&option_types).map(|(x, opt)| {
+    let option_types = fields
+        .named
+        .iter()
+        .map(|x| match as_surrounding_type(&x.ty, "Option") {
+            Some(ty) => ClassifyType::Option(ty),
+            None => match check_attr(x) {
+                Some(res) => res,
+                None => ClassifyType::Other(&x.ty),
+            },
+        });
+    let fields = fields.named.iter().zip(option_types).collect_vec();
+    let fields_option = fields.iter().map(|(x, opt)| {
+        let ident = &x.ident;
+        let ty = &x.ty;
+        match opt {
+            ClassifyType::Vec(ty, _) => quote!( #ident: Vec<#ty> ),
+            _ => quote!( #ident: Option<#ty> ),
+        }
+    });
+    let constructor = fields.iter().map(|(x, opt)| {
         let ident = &x.ident;
         match opt {
-            None => quote!( #ident: None ),
-            Some(_) => quote!( #ident: Some(None) ),
+            ClassifyType::Option(_) => quote!( #ident: Some(None) ),
+            ClassifyType::Vec(..) => quote!( #ident: Vec::new() ),
+            ClassifyType::Other(_) => quote!( #ident: None ),
         }
     });
-    let fields_option = fields.named.iter().map(|x| {
+    let setters = fields.iter().map(|(x, opt)| {
         let ident = &x.ident;
-        let ty = &x.ty;
-        quote!( #ident: Option<#ty> )
-    });
-    let setters = fields.named.iter().zip(&option_types).map(|(x, opt)| {
-        let ident = &x.ident;
-        let ty = &x.ty;
-        if let Some(ty) = opt {
-            quote! {
-                fn #ident(&mut self, #ident: #ty) -> &mut Self {
-                    self.#ident = Some(Some(#ident));
-                    self
+        match opt {
+            ClassifyType::Option(ty) => {
+                quote! {
+                    fn #ident(&mut self, #ident: #ty) -> &mut Self {
+                        self.#ident = Some(Some(#ident));
+                        self
+                    }
                 }
             }
-        } else {
-            quote! {
-                fn #ident(&mut self, #ident: #ty) -> &mut Self {
-                    self.#ident = Some(#ident);
-                    self
+            ClassifyType::Other(ty) => {
+                quote! {
+                    fn #ident(&mut self, #ident: #ty) -> &mut Self {
+                        self.#ident = Some(#ident);
+                        self
+                    }
+                }
+            }
+            ClassifyType::Vec(ty, name) => {
+                quote! {
+                    fn #name(&mut self, #ident: #ty) -> &mut Self {
+                        self.#ident.push(#ident);
+                        self
+                    }
                 }
             }
         }
     });
-    let build_fields = fields.named.iter().map(|x| {
+    let build_fields = fields.iter().map(|(x, opt)| {
         let ident = &x.ident;
-        quote! {
-            #ident: self.#ident.as_ref()?.clone()  // :thinking_face:
+        match opt {
+            ClassifyType::Vec(..) => quote! {
+                #ident: self.#ident.clone()
+            },
+            _ => quote! {
+                #ident: self.#ident.as_ref()?.clone()  // :thinking_face:
+            },
         }
     });
 
@@ -78,7 +108,6 @@ pub fn derive(input: TokenStream) -> TokenStream {
             #(#setters)*
 
             fn build(&mut self) -> ::anyhow::Result<#name> {
-                dbg!(&self);
                 (|| -> Option<_> {
                     Some(#name {
                         #(#build_fields),*
@@ -92,7 +121,13 @@ pub fn derive(input: TokenStream) -> TokenStream {
     ret.into()
 }
 
-fn as_option(ty: &Type) -> Option<&Type> {
+enum ClassifyType<'a> {
+    Option(&'a Type),
+    Vec(&'a Type, Ident),
+    Other(&'a Type),
+}
+
+fn as_surrounding_type<'a, 'b>(ty: &'a Type, name: &'b str) -> Option<&'a Type> {
     let path = match ty {
         Type::Path(path) => path,
         _ => return None,
@@ -105,7 +140,7 @@ fn as_option(ty: &Type) -> Option<&Type> {
         return None;
     }
     let ty = path.last()?;
-    if ty.ident != "Option" {
+    if ty.ident != name {
         return None;
     }
     let args = match &ty.arguments {
@@ -119,4 +154,47 @@ fn as_option(ty: &Type) -> Option<&Type> {
         GenericArgument::Type(ty) => Some(ty),
         _ => None,
     }
+}
+
+fn check_attr(field: &Field) -> Option<ClassifyType> {
+    let attr = field
+        .attrs
+        .iter()
+        .filter(|x| path_is_just(&x.path, "builder"))
+        .last()?;
+    let val = match attr.parse_meta().ok()? {
+        Meta::List(v) => v.nested,
+        _ => return None,
+    };
+    if val.len() != 1 {
+        return None;
+    }
+    let val = match val.first()? {
+        NestedMeta::Meta(Meta::NameValue(v)) if path_is_just(&v.path, "each") => v,
+        _ => return None,
+    };
+    match &val.lit {
+        Lit::Str(s) => {
+            let ty = as_surrounding_type(&field.ty, "Vec")?;
+            let ident = parse_str::<Ident>(&s.value()).ok()?;
+            Some(ClassifyType::Vec(ty, ident))
+        }
+        _ => None,
+    }
+}
+
+fn path_is_just(p: &Path, s: &str) -> bool {
+    if p.leading_colon.is_some() {
+        return false;
+    }
+    let p = &p.segments;
+    if p.len() != 1 {
+        return false;
+    }
+    let p = p.first().unwrap();
+    match p.arguments {
+        PathArguments::None => {}
+        _ => return false,
+    };
+    p.ident == s
 }

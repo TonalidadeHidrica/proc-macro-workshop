@@ -21,4 +21,3 @@ itertools = "0.10.3"
 proc-macro2 = "1.0.34"
 quote = "1.0.10"
 syn = "1.0.83"
-# TODO
