@@ -1,8 +1,9 @@
+use itertools::{process_results, Itertools};
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    parse_macro_input, spanned::Spanned, Attribute, Data, DeriveInput, Fields, Lit, LitStr, Meta,
-    Path, PathArguments,
+    parse_macro_input, parse_quote, spanned::Spanned, Attribute, Data, DeriveInput, Fields, Lit,
+    LitStr, Meta, Path, PathArguments, WhereClause, WherePredicate,
 };
 
 #[proc_macro_derive(CustomDebug, attributes(debug))]
@@ -11,19 +12,27 @@ pub fn derive(input: TokenStream) -> TokenStream {
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
-fn derive_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+fn derive_impl(mut input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let input_span = input.span();
     let struct_ident = &input.ident;
+    let generics = &mut input.generics;
+    let type_params = generics
+        .type_params()
+        .cloned()
+        .collect_vec()
+        .into_iter()
+        .map(|x| x.ident);
     let strct = match &input.data {
         Data::Struct(s) => s,
         Data::Enum(_) => {
             return Err(syn::Error::new(
-                input.span(),
+                input_span,
                 "Expected a struct, found an enum",
             ))
         }
         Data::Union(_) => {
             return Err(syn::Error::new(
-                input.span(),
+                input_span,
                 "Expected a struct, found a union",
             ))
         }
@@ -32,30 +41,49 @@ fn derive_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         Fields::Named(f) => &f.named,
         Fields::Unnamed(_) => {
             return Err(syn::Error::new(
-                input.span(),
+                input_span,
                 "Expeted a named struct, found an unnamed struct",
             ))
         }
         Fields::Unit => {
             return Err(syn::Error::new(
-                input.span(),
+                input_span,
                 "Expeted a named struct, found a unit struct",
             ))
         }
     };
-    let builders = fields
-        .iter()
-        .map(|field| {
-            let ident = field.ident.as_ref().unwrap();
-            let value = match extract_debug(&field.attrs)? {
-                Some(fmt) => quote!( &format_args!(#fmt, &self.#ident) ),
-                None => quote!( &self.#ident ),
-            };
-            Ok(quote!( .field(stringify!(#ident), #value) ))
-        })
-        .collect::<syn::Result<Vec<_>>>()?;
+    let vec = fields.iter().map(|field| {
+        let ident = field.ident.as_ref().unwrap();
+        let ty = &field.ty;
+        let debug_attr = extract_debug(&field.attrs)?;
+        let value = match &debug_attr {
+            Some(fmt) => quote!(&format_args!(#fmt, &self.#ident)),
+            None => quote!(&self.#ident),
+        };
+        let quote = quote!( .field(stringify!(#ident), #value) );
+        let constraint = match &debug_attr {
+            Some(_) => None,
+            None => Option::<WherePredicate>::Some(parse_quote!(#ty: ::std::fmt::Debug)),
+        };
+        Ok((quote, constraint))
+    });
+    let (builders, constraints): (Vec<_>, Vec<_>) =
+        process_results::<_, _, _, syn::Error, _>(vec, |x| x.unzip())?;
+    let mut constraints = constraints.into_iter().flatten().peekable();
+    let where_clause = constraints.peek().is_some().then(|| {
+        // We deprive of where clause, because it will not be serialized anyway
+        let mut where_clause = generics
+            .where_clause
+            .take()
+            .unwrap_or_else(|| -> WhereClause { parse_quote!(where) });
+        for c in constraints {
+            where_clause.predicates.push(c);
+        }
+        where_clause
+    });
+    let where_clause = where_clause.into_iter();
     Ok(quote! {
-        impl ::std::fmt::Debug for #struct_ident {
+        impl <#(#type_params)*> ::std::fmt::Debug for #struct_ident #generics #(#where_clause)* {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 f.debug_struct(stringify!(#struct_ident))
                     #(#builders)*
